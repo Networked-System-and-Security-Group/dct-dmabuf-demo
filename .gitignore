@@ -1,0 +1,7 @@
+dct_test
+dct_test_remote
+dct_test_gpu
+*.o
+*.log
+core
+core.*
