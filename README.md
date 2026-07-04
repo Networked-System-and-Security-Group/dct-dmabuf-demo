@@ -4,8 +4,7 @@ Minimal Mellanox/NVIDIA mlx5 DC QP demos for validating:
 
 - DCT/DCI creation and DC RDMA Write
 - split sender/receiver DC Write across two hosts
-- GPU memory registration through CUDA DMA-BUF
-- the perftest-style GPU DMA-BUF address layout (`base + 64 KiB`)
+- GPU memory registration through CUDA DMA-BUF (perftest-aligned)
 - basic data consistency under repeated sends
 
 The code was tested on hosts `192.168.5.112` and `192.168.5.113`, using the
@@ -109,43 +108,36 @@ Disable the sender-side CUDA sync:
 ./dct_test_gpu -c -a 10.99.3.3 -p 19997 -d mlx5_1 -g 0 -n 1000 -z 64 -N
 ```
 
-Tested results on 112 -> 113:
+Tested results on 112 -> 113 (perftest-aligned registration, no +64 KiB offset):
 
 | Payload | Iterations | Sender sync | Result |
 | --- | ---: | --- | --- |
 | 64 B | 1000 | on | passed, `verify_fail=0` |
-| 64 B | 1000 | off | failed, hundreds of verify errors |
 | 4 KiB | 1000 | on | passed, `verify_fail=0` |
-| 4 KiB | 1000 | off | passed in the tested run |
-| 64 KiB | 1000 | on | passed, `verify_fail=0` |
-| 64 KiB | 1000 | off | passed in the tested run |
 
 The 64 B no-sync failure is intentional and useful: send CQE success does not
 prove the remote GPU sees the intended data if the sender-side GPU writes have
 not been made visible to the NIC.
 
-## DMA-BUF Offset
+## DMA-BUF Registration
 
-`dct_test_gpu.c` intentionally follows the perftest CUDA DMA-BUF layout:
+`dct_test_gpu.c` follows the perftest CUDA DMA-BUF pattern (`cuda_memory.c` +
+`perftest_resources.c`):
 
-```c
-#define GPU_REG_SIZE 131072
-#define GPU_DATA_OFF 65536
-```
+1. Round CUDA allocation up to a 64 KiB GPU page (`ACCEL_PAGE_SIZE`).
+2. Export DMA-BUF from the 4 KiB page-aligned start address.
+3. Register with `iova = cudaMalloc ptr` and `fd_offset = dptr - aligned_ptr`.
+4. Use the `cudaMalloc` pointer directly for local SGE and remote RDMA address.
 
-The program registers a 128 KiB CUDA DMA-BUF region using the CUDA allocation
-base as IOVA, but it performs RDMA from/to `base + 64 KiB`.
+An earlier prototype used a `base + 64 KiB` RDMA offset as a workaround for
+incorrect registration (export from raw base with `fd_offset = 0`). That offset
+is **not** part of perftest and is **not** needed once registration matches
+perftest. On 112/113, `fd_offset` is typically `0` because `cudaMalloc` is
+already page-aligned.
 
-This matters. Using the raw CUDA allocation base as the RDMA address produced
-successful send CQEs but empty or stale remote data in our tests. With the
-`base + 64 KiB` data offset, cross-host GPU-to-GPU, GPU-to-host, and
-host-to-GPU transfers all succeeded.
-
-The offset is part of the buffer layout used for both the local SGE and the
-remote RDMA address, so it does not change data consistency by itself. It only
-selects a valid data subrange inside the registered DMA-BUF mapping. Consistency
-still depends on proper sender-side GPU synchronization/flush before NIC reads
-and receiver-side visibility/invalidation before GPU consumers read data.
+Consistency still depends on proper sender-side GPU synchronization before the
+NIC reads GPU memory, and receiver-side visibility before GPU consumers read
+data.
 
 ## Known Limitations
 

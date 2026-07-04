@@ -4,6 +4,12 @@
  * Replaces ibv_reg_mr(host) with:
  *   cudaMalloc → cuMemGetHandleForAddressRange(DMA_BUF_FD) → ibv_reg_mr_ex
  *
+ * DMA-BUF registration follows the perftest pattern (cuda_memory.c):
+ *   - alloc rounded up to 64KB GPU page
+ *   - export from 4KB-page-aligned address
+ *   - iova = original cudaMalloc ptr, fd_offset = small page gap
+ *   - RDMA addresses the cudaMalloc ptr directly (no +64KB offset)
+ *
  * Usage:
  *   loopback: ./dct_test_gpu -l [-d mlx5_1] [-g 0]
  *   server:   ./dct_test_gpu -s [-p port] [-d mlx5_1] [-g 0]
@@ -11,8 +17,7 @@
  *
  * Build:
  *   gcc -O2 -o dct_test_gpu dct_test_gpu.c -libverbs -lmlx5 \
- *       -I/usr/local/cuda/include -L/usr/local/cuda/lib64 -lcuda -lcudart \
- *       -Wl,-rpath,/usr/local/cuda/lib64
+ *       -I/usr/local/cuda/include -L/usr/local/cuda/lib64 -lcuda -lcudart
  */
 
 #include <stdio.h>
@@ -37,8 +42,7 @@
 #define POLL_RETRIES 100000
 #define GID_IDX      3
 #define TCP_PORT     19997
-#define GPU_REG_SIZE 131072
-#define GPU_DATA_OFF 65536   /* perftest DC dmabuf uses VAddr = base + 64KB */
+#define ACCEL_PAGE_SIZE (64 * 1024)  /* GPU page / BAR chunk size (perftest) */
 
 struct dct_remote_info {
     uint32_t dct_num;
@@ -60,7 +64,7 @@ static int g_host_recv = 0; /* server: host MR for DCT buffer */
 static int g_host_send = 0; /* client: host MR for DCI source buffer */
 static int g_iters = 1;     /* client: number of RDMA writes */
 static int g_no_sync = 0;   /* client: skip cudaDeviceSynchronize before post */
-static size_t g_payload = 64; /* bytes per transfer (at GPU_DATA_OFF) */
+static size_t g_payload = 64; /* bytes per transfer */
 
 static void gpu_check(cudaError_t e, const char *msg)
 {
@@ -107,38 +111,52 @@ static int gpu_init(void)
 
 static int gpu_reg_mr(struct ibv_pd *pd, struct gpu_mr *gm, size_t size, int access)
 {
-    long page = sysconf(_SC_PAGESIZE);
-    if (page <= 0) page = 4096;
-    /* perftest aligns GPU registration to 128KB for dmabuf */
-    size_t reg_size = GPU_REG_SIZE;
-    if (size + GPU_DATA_OFF > reg_size) reg_size = size + GPU_DATA_OFF;
+    /* perftest-aligned DMA-BUF registration:
+     *   - round up allocation to GPU page (64KB)
+     *   - round down export address to host page (4KB)
+     *   - iova = original cudaMalloc ptr; fd_offset = small page gap
+     *   - RDMA uses the original cudaMalloc ptr directly (no +64KB hack)
+     */
+    long host_page = sysconf(_SC_PAGESIZE);
+    if (host_page <= 0) host_page = 4096;
+
+    size_t alloc_size = (size + ACCEL_PAGE_SIZE - 1) & ~((size_t)ACCEL_PAGE_SIZE - 1);
 
     gm->size = size;
     gm->dptr = NULL;
     gm->mr = NULL;
 
-    gpu_check(cudaMalloc(&gm->dptr, reg_size), "cudaMalloc");
+    gpu_check(cudaMalloc(&gm->dptr, alloc_size), "cudaMalloc");
+
+    uintptr_t aligned_ptr = (uintptr_t)gm->dptr & ~((uintptr_t)host_page - 1);
+    uint64_t fd_offset = (uint64_t)(uintptr_t)gm->dptr - (uint64_t)aligned_ptr;
+    size_t aligned_size = (size + fd_offset + (size_t)host_page - 1) & ~((size_t)host_page - 1);
+
+    printf("[gpu] dptr=%p alloc=%zu aligned_ptr=0x%lx fd_offset=%lu aligned_size=%zu\n",
+           gm->dptr, alloc_size, (unsigned long)aligned_ptr,
+           (unsigned long)fd_offset, aligned_size);
 
     int fd = -1;
     CUresult cr = cuMemGetHandleForAddressRange(
-        &fd, (CUdeviceptr)gm->dptr, reg_size,
+        &fd, (CUdeviceptr)aligned_ptr, aligned_size,
         CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD,
         CU_MEM_RANGE_FLAG_DMA_BUF_MAPPING_TYPE_PCIE);
     if (cr != CUDA_SUCCESS) {
         cr = cuMemGetHandleForAddressRange(
-            &fd, (CUdeviceptr)gm->dptr, reg_size,
+            &fd, (CUdeviceptr)aligned_ptr, aligned_size,
             CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0);
     }
     cu_check(cr, "cuMemGetHandleForAddressRange");
 
     uint64_t iova = (uint64_t)(uintptr_t)gm->dptr;
     struct ibv_mr_init_attr attr = {
-        .length = reg_size,
+        .length = aligned_size,
         .access = access,
-        .comp_mask = IBV_REG_MR_MASK_IOVA | IBV_REG_MR_MASK_FD,
+        .comp_mask = IBV_REG_MR_MASK_IOVA | IBV_REG_MR_MASK_FD |
+                     IBV_REG_MR_MASK_FD_OFFSET,
         .iova = iova,
         .fd = fd,
-        .fd_offset = 0,
+        .fd_offset = fd_offset,
     };
     gm->mr = ibv_reg_mr_ex(pd, &attr);
     close(fd);
@@ -146,10 +164,10 @@ static int gpu_reg_mr(struct ibv_pd *pd, struct gpu_mr *gm, size_t size, int acc
         /* fallback to ibv_reg_dmabuf_mr */
         fd = -1;
         cr = cuMemGetHandleForAddressRange(
-            &fd, (CUdeviceptr)gm->dptr, reg_size,
+            &fd, (CUdeviceptr)aligned_ptr, aligned_size,
             CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0);
         cu_check(cr, "cuMemGetHandleForAddressRange retry");
-        gm->mr = ibv_reg_dmabuf_mr(pd, 0, reg_size, iova, fd, access);
+        gm->mr = ibv_reg_dmabuf_mr(pd, fd_offset, aligned_size, iova, fd, access);
         close(fd);
     }
     if (!gm->mr) {
@@ -158,9 +176,9 @@ static int gpu_reg_mr(struct ibv_pd *pd, struct gpu_mr *gm, size_t size, int acc
         gm->dptr = NULL;
         return -1;
     }
-    printf("[gpu] dmabuf MR: dptr=%p lkey=0x%x rkey=0x%x reg_size=%zu iova=0x%lx\n",
-           gm->dptr, gm->mr->lkey, gm->mr->rkey, reg_size,
-           (unsigned long)iova);
+    printf("[gpu] dmabuf MR: dptr=%p lkey=0x%x rkey=0x%x iova=0x%lx fd_offset=%lu\n",
+           gm->dptr, gm->mr->lkey, gm->mr->rkey,
+           (unsigned long)iova, (unsigned long)fd_offset);
     return 0;
 }
 
@@ -361,8 +379,8 @@ static int dc_write(struct ibv_qp *dci, struct ibv_pd *pd, struct ibv_ah *ah,
 {
     struct ibv_qp_ex *qpx = ibv_qp_to_qp_ex(dci);
     struct mlx5dv_qp_ex *dv = mlx5dv_qp_ex_from_ibv_qp_ex(qpx);
-    uint64_t raddr = (uint64_t)(uintptr_t)remote->dptr + GPU_DATA_OFF;
-    uint64_t laddr = (uint64_t)(uintptr_t)local->dptr + GPU_DATA_OFF;
+    uint64_t raddr = (uint64_t)(uintptr_t)remote->dptr;
+    uint64_t laddr = (uint64_t)(uintptr_t)local->dptr;
 
     ibv_wr_start(qpx);
     qpx->wr_id = 1;
@@ -426,9 +444,9 @@ static int run_loopback(const char *want_dev)
         goto cleanup;
 
     const size_t len = 64;
-    gpu_check(cudaMemset((char *)dci_gm.dptr + GPU_DATA_OFF, 0xAB, len),
+    gpu_check(cudaMemset((char *)dci_gm.dptr, 0xAB, len),
               "cudaMemset src");
-    gpu_check(cudaMemset((char *)dct_gm.dptr + GPU_DATA_OFF, 0, len),
+    gpu_check(cudaMemset((char *)dct_gm.dptr, 0, len),
               "cudaMemset dst");
 
     struct ibv_ah_attr ah_attr = {};
@@ -450,7 +468,7 @@ static int run_loopback(const char *want_dev)
 
     unsigned char host[64], expect[64];
     memset(expect, 0xAB, len);
-    gpu_check(cudaMemcpy(host, (char *)dct_gm.dptr + GPU_DATA_OFF, len,
+    gpu_check(cudaMemcpy(host, (char *)dct_gm.dptr, len,
                          cudaMemcpyDeviceToHost),
               "D2H verify");
     if (memcmp(host, expect, len) != 0) {
@@ -533,7 +551,7 @@ static int run_server(int tcp_port, const char *want_dev)
         goto cleanup;
     }
     if (!g_host_recv)
-        gpu_check(cudaMemset((char *)dct_gm.dptr + GPU_DATA_OFF, 0, BUF_SIZE),
+        gpu_check(cudaMemset((char *)dct_gm.dptr, 0, BUF_SIZE),
                   "cudaMemset dst");
 
     printf("[server] DCT#=%u key=0x%016lx (GPU recv buffer)\n", dct->qp_num,
@@ -561,7 +579,7 @@ static int run_server(int tcp_port, const char *want_dev)
         info.addr = (uint64_t)(uintptr_t)host_buf;
     } else {
         info.rkey = dct_gm.mr->rkey;
-        info.addr = (uint64_t)(uintptr_t)dct_gm.dptr + GPU_DATA_OFF;
+        info.addr = (uint64_t)(uintptr_t)dct_gm.dptr;
     }
     info.dct_key = dct_key;
     memcpy(info.gid, gid.raw, 16);
@@ -598,7 +616,7 @@ static int run_server(int tcp_port, const char *want_dev)
             if (g_host_recv) {
                 memcpy(recv_host, host_buf, g_payload);
             } else {
-                gpu_check(cudaMemcpy(recv_host, (char *)dct_gm.dptr + GPU_DATA_OFF,
+                gpu_check(cudaMemcpy(recv_host, (char *)dct_gm.dptr,
                                      g_payload, cudaMemcpyDeviceToHost),
                           "D2H verify");
             }
@@ -641,7 +659,7 @@ static int run_server(int tcp_port, const char *want_dev)
     if (g_host_recv) {
         memcpy(host, host_buf, sizeof(host) - 1);
     } else {
-        gpu_check(cudaMemcpy(host, (char *)dct_gm.dptr + GPU_DATA_OFF,
+        gpu_check(cudaMemcpy(host, (char *)dct_gm.dptr,
                              sizeof(host) - 1, cudaMemcpyDeviceToHost),
                   "D2H");
     }
@@ -740,12 +758,12 @@ static int run_client(const char *server_ip, int tcp_port, const char *want_dev)
     } else {
         if (gpu_reg_mr(pd, &dci_gm, BUF_SIZE, IBV_ACCESS_LOCAL_WRITE))
             goto cleanup;
-        gpu_check(cudaMemcpy((char *)dci_gm.dptr + GPU_DATA_OFF, msg, len,
+        gpu_check(cudaMemcpy((char *)dci_gm.dptr, msg, len,
                              cudaMemcpyHostToDevice),
                   "H2D src");
         gpu_check(cudaDeviceSynchronize(), "pre-post sync");
         lkey = dci_gm.mr->lkey;
-        sge_addr = (uint64_t)(uintptr_t)dci_gm.dptr + GPU_DATA_OFF;
+        sge_addr = (uint64_t)(uintptr_t)dci_gm.dptr;
     }
 
     struct ibv_ah_attr ah_attr = {};
@@ -785,7 +803,7 @@ static int run_client(const char *server_ip, int tcp_port, const char *want_dev)
         if (g_host_send) {
             memcpy(host_send, payload, g_payload);
         } else {
-            gpu_check(cudaMemcpy((char *)dci_gm.dptr + GPU_DATA_OFF, payload,
+            gpu_check(cudaMemcpy((char *)dci_gm.dptr, payload,
                                  g_payload, cudaMemcpyHostToDevice),
                       "H2D src");
             if (!g_no_sync)
@@ -886,9 +904,9 @@ int main(int argc, char **argv)
         }
     }
 
-    if (g_payload == 0 || g_payload + GPU_DATA_OFF > GPU_REG_SIZE) {
+    if (g_payload == 0 || g_payload > ACCEL_PAGE_SIZE) {
         fprintf(stderr, "payload must be 1..%d bytes\n",
-                (int)(GPU_REG_SIZE - GPU_DATA_OFF));
+                (int)ACCEL_PAGE_SIZE);
         return 1;
     }
 
